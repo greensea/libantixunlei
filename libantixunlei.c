@@ -5,14 +5,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <signal.h>
 
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/msg.h>
 
 #include "libantixunlei.h"
 #include "hashtable.h"
-
-//#include "hashtable.c"
 
 hashtable_t* axl_clients;
 hashtable_t* axl_ips;
@@ -26,10 +27,26 @@ long axl_ip_sleep_time = AXL_DENYIP_TIME;
 pthread_mutex_t axl_sweeper_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
+#ifdef AXL_WITH_FORKSUPPORT
+pid_t axl_parent_pid;
+pthread_t axl_hdlid_rcvcmd;
+pthread_t axl_hdlid_ipdeny;
+pthread_t axl_hdlid_sessbye;
+pthread_t axl_hdlid_ipdenined;
+int axl_pmsgid;
+//int axl_pmsgid_rcvcmd;
+//int axl_pmsgid_ipdeny;
+//int axl_pmsgid_sessbye;
+pthread_mutex_t axl_clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+struct sigaction axl_fork_sig, axl_fork_oldsig;
+#endif
+
 /**
  * 初始化反迅雷库
  * 
- * 在使用任何反迅雷库的函数之前，必须调用该函数
+ * 在使用任何反迅雷库的函数之前，必须调用该函数。
+ * 
+ * 如果启用了 FORKSUPPORT，则只能在FTP主进程中调用这个函数一次（且仅一次）。绝不能在fork()出来的子进程中调用此函数.
  */
 int axl_init(){
 	/**
@@ -37,7 +54,7 @@ int axl_init(){
 	 */
 #ifdef AXL_WITH_DENYIP
 	if (sizeof(axl_ip_node_t) > sizeof(axl_client_node_t)) {
-		printf("程序错误，axl_ip_node_t 类型占用的内存大于 axl_client_node_t 占用的内存\n");
+		printf("程序错误，axl_ip_node_t 类型占用的内存与 axl_client_node_t 类型占用的内存不相等\n");
 		exit(1);
 	}
 #endif
@@ -72,6 +89,10 @@ int axl_init(){
 	// 初始化哈希链表
 	axl_clients = hashtable_init(1003);
 
+#ifdef AXL_WITH_FORKSUPPORT
+	axl_parent_pid = getpid();
+#endif
+
 #ifdef AXL_WITH_DENYIP	
 	// 创建IP封禁地址空间，同时创建清理线程
 	pthread_t sweeper_pid;
@@ -79,9 +100,50 @@ int axl_init(){
 	axl_ips = hashtable_init(1003);
 	pthread_create(&sweeper_pid, NULL, (void*)axl_ip_sweeper, NULL);
 #endif
+
+#ifdef AXL_WITH_FORKSUPPORT
+	// 防止出现僵死进程
+	sigaddset(&axl_fork_sig.sa_mask, SIGCHLD);
+	axl_fork_sig.sa_flags = SA_NOCLDWAIT;
+	sigaction(SIGCHLD, &axl_fork_sig, &axl_fork_oldsig);
+
+	// 创建父进程的接收消息队列
+	axl_pmsgid = msgget(AXL_PARENT_MSGKEY + getpid(), IPC_CREAT | 0666);
+	if (axl_pmsgid == -1) {
+		printf("(%s,%d)程序错误，无法创建消息队列，msgget函数返回%d\n", __func__, __LINE__, axl_pmsgid);
+		printf("错误码：errno=%d; EACCES=%d, EEXIST=%d, ENOENT=%d, ENOMEM=%d, ENOSPC=%d\n", errno, EACCES, EEXIST, ENOENT, ENOMEM, ENOSPC);
+		exit(1);
+	}
+	//axl_pmsgid_ipdeny = msgget(AXL_PARENT_MSGKEY + 1, IPC_CREAT | IPC_EXCL | 0666);
+	//axl_pmsgid_sessbye = msgget(AXL_PARENT_MSGKEY + 2, IPC_CREAT | IPC_EXCL | 0666);
+	
+	// 创建消息处理线程
+	printf("axl_pmsgid=%d\n", axl_pmsgid);
+	pthread_create(&axl_hdlid_rcvcmd, NULL, (void*)axl_msg_handler_rcvmsg, NULL);
+	pthread_create(&axl_hdlid_ipdeny, NULL, (void*)axl_msg_handler_ip_deny, NULL);
+	pthread_create(&axl_hdlid_sessbye, NULL, (void*)axl_msg_handler_session_bye, NULL);
+	pthread_create(&axl_hdlid_ipdenined, NULL, (void*)axl_msg_handler_ip_denined, NULL);
+	
+#endif
 	
 	return 0;
 }
+
+int axl_destroy(){
+#ifdef AXL_WITH_FORKSUPPORT
+	// 终止消息处理线程，删除消息队列
+	pthread_cancel(axl_hdlid_rcvcmd);
+	pthread_cancel(axl_hdlid_ipdeny);
+	pthread_cancel(axl_hdlid_sessbye);
+	pthread_cancel(axl_hdlid_ipdenined);
+	msgctl(axl_pmsgid, IPC_RMID, NULL);
+	//msgctl(axl_pmsgid_ipdeny, IPC_RMID, NULL);
+	//msgctl(axl_pmsgid_sessbye, IPC_RMID, NULL);
+#endif
+	
+	return 0;
+}
+	
 
 /**
  * @param axl_ftpcmd_t cmd 接收到的FTP指令
@@ -94,7 +156,17 @@ axl_isxunlei_t axl_recive_command(axl_ftpcmd_t cmd, unsigned long sess_id){
 	axl_ftpcmd_tree_node* tnode;
 	short int hypothetical_flag;
 	
+#ifdef AXL_WITH_FORKSUPPORT
+	// 如果FTP服务器是作为守护进程模式运行的，就进行信号处理。如果该进程是子进程则使用信号处理函数
+	if (getpid() != axl_parent_pid) {
+		return axl_recive_command_msg(cmd, sess_id);
+	}
+#endif
+
+	pthread_mutex_lock(&axl_clients_mutex);	/* 进入临界区，信号量：clients */
 	client = hashtable_find(axl_clients, sess_id);
+
+	
 	// 如果查找无果，则将这家伙添加下去
 	if (client == NULL) {
 		client = axl_client_addnew(sess_id);
@@ -103,6 +175,7 @@ axl_isxunlei_t axl_recive_command(axl_ftpcmd_t cmd, unsigned long sess_id){
 	// 如果这家伙的身份已经确定，则直接返回
 	else if (client->is_xunlei != AXL_ISXUNLEI_UNKNOWN) {
 		//printf("confirmed\n");
+		pthread_mutex_unlock(&axl_clients_mutex);	/* 离开临界区，信号量：clients */
 		return client->is_xunlei;
 	}
 	
@@ -144,6 +217,8 @@ hypothetical_loop:
 		else {
 			client->is_xunlei = AXL_ISXUNLEI_NO;
 		}
+		
+		pthread_mutex_unlock(&axl_clients_mutex);	/* 离开临界区，信号量：clients */
 		return client->is_xunlei;
 	}
 	else if (tnode->is_xunlei == AXL_ISXUNLEI_NO) {
@@ -158,6 +233,7 @@ hypothetical_loop:
 		}	
 	}
 	
+	pthread_mutex_unlock(&axl_clients_mutex);	/* 离开临界区，信号量：clients */
 	return client->is_xunlei;
 }
 
@@ -166,7 +242,7 @@ hypothetical_loop:
  */
 axl_isxunlei_t axl_recive_command_string(const char* cmd, unsigned long sess_id){
 	int i;
-	char* s;
+	char s[5] = {0};
 	axl_isxunlei_t ret;
 	
 	// 转换成小写
@@ -176,28 +252,28 @@ axl_isxunlei_t axl_recive_command_string(const char* cmd, unsigned long sess_id)
 	}
 	
 	// strcmp比较指令
-	if (strcmp(cmd, "user") == 0) {
+	if (strcmp(s, "user") == 0) {
 		ret = axl_recive_command(AXL_FTPCMD_USER, sess_id);
 	}
-	else if(strcmp(cmd, "pass") == 0) {
+	else if(strcmp(s, "pass") == 0) {
 		ret = axl_recive_command(AXL_FTPCMD_PASS, sess_id);
 	}
-	else if(strcmp(cmd, "cwd") == 0) {
+	else if(strcmp(s, "cwd") == 0) {
 		ret = axl_recive_command(AXL_FTPCMD_CWD, sess_id);
 	}
-	else if(strcmp(cmd, "type") == 0) {
+	else if(strcmp(s, "type") == 0) {
 		ret = axl_recive_command(AXL_FTPCMD_TYPE, sess_id);
 	}
-	else if(strcmp(cmd, "size") == 0) {
+	else if(strcmp(s, "size") == 0) {
 		ret = axl_recive_command(AXL_FTPCMD_SIZE, sess_id);
 	}
-	else if(strcmp(cmd, "pasv") == 0) {
+	else if(strcmp(s, "pasv") == 0) {
 		ret = axl_recive_command(AXL_FTPCMD_PASV, sess_id);
 	}
-	else if(strcmp(cmd, "rest") == 0) {
+	else if(strcmp(s, "rest") == 0) {
 		ret = axl_recive_command(AXL_FTPCMD_REST, sess_id);
 	}
-	else if(strcmp(cmd, "retr") == 0) {
+	else if(strcmp(s, "retr") == 0) {
 		ret = axl_recive_command(AXL_FTPCMD_RETR, sess_id);
 	}
 	else {
@@ -218,7 +294,9 @@ axl_isxunlei_t axl_recive_password(char* pass, unsigned long sess_id){
 	axl_client_node_t* client;
 	
 	// 查找，如果找不到这个用户，说明这个用户肯定先发送了PASS指令而没有发送USER指令，所以不是迅雷
+	pthread_mutex_lock(&axl_clients_mutex);	/* 进入临界区，信号量：clients */
 	client = hashtable_find(axl_clients, sess_id);
+	pthread_mutex_unlock(&axl_clients_mutex);	/* 离开临界区，信号量：clients */
 	if (client == NULL) return AXL_ISXUNLEI_NO;
 	
 	if (strcmp(pass, "IEUser@") == 0) {
@@ -239,7 +317,9 @@ axl_isxunlei_t axl_recive_username(char* username, unsigned long sess_id){
 	axl_client_node_t* client;
 	
 	// 查找，如果找不到这个用户，说明这个用户肯定先发送了PASS指令而没有发送USER指令，所以不是迅雷
+	pthread_mutex_lock(&axl_clients_mutex);	/* 进入临界区，信号量：clients */
 	client = hashtable_find(axl_clients, sess_id);
+	pthread_mutex_unlock(&axl_clients_mutex);	/* 离开临界区，信号量：clients */
 	if (client == NULL) return AXL_ISXUNLEI_NO;	
 	
 	return client->is_xunlei;
@@ -269,7 +349,15 @@ int axl_session_setip(unsigned long sess_id, unsigned long ip){
  * 当一个连接中断的时候，必须调用此函数
  */
 int axl_session_bye(unsigned long sess_id){
+#ifdef AXL_WITH_FORKSUPPORT
+	if (getpid() != axl_parent_pid) {
+		return axl_session_bye_msg(sess_id);
+	}
+#endif
+	
+	pthread_mutex_lock(&axl_clients_mutex);	/* 进入临界区，信号量：clients */
 	hashtable_delete(axl_clients, sess_id);
+	pthread_mutex_unlock(&axl_clients_mutex);	/* 离开临界区，信号量：clients */
 	
 	return 0;
 }
@@ -311,6 +399,12 @@ int axl_ip_deny(unsigned long ip){
 	axl_client_node_t cnode;
 	axl_ip_node_t* ipnode;
 	
+#ifdef AXL_WITH_FORKSUPPORT
+	if (getpid() != axl_parent_pid) {
+		return axl_ip_deny_msg(ip);
+	}
+#endif
+	
 	pthread_mutex_lock(&axl_sweeper_mutex);	// 进入临界区
 	
 	if (hashtable_find(axl_ips, ip) != NULL) {
@@ -322,7 +416,7 @@ int axl_ip_deny(unsigned long ip){
 	ipnode = (axl_ip_node_t*)&cnode;
 	ipnode->assign_time = time(NULL);
 	ipnode->next_key = 0;
-	
+
 	// 增加IP，并做好尾链
 	ipnode = (axl_ip_node_t*)hashtable_add(axl_ips, ip, cnode);
 	if (axl_ip_delete_key == 0) {
@@ -347,6 +441,12 @@ int axl_ip_deny(unsigned long ip){
  */
 int axl_ip_denined(unsigned long ip){
 	axl_client_node_t* p;
+
+#ifdef AXL_WITH_FORKSUPPORT
+	if (getpid() != axl_parent_pid) {
+		return axl_ip_denined_msg(ip);
+	}
+#endif
 	
 	pthread_mutex_lock(&axl_sweeper_mutex);	// 进入临界区
 	p = hashtable_find(axl_ips, ip);
@@ -368,10 +468,14 @@ void axl_ip_sweeper(){
 	axl_ip_node_t* ipnode;
 	
 	ipnode = NULL;
+
+#ifdef AXL_WITH_FORKSUPPORT
+	if (getpid() != axl_parent_pid) return;
+#endif
 	
 	for (;;) {
 		// 如果没有需要删除的IP，就可以进入最大程度的睡眠
-		printf("axl_ip_delete_key=%lu\n", axl_ip_delete_key);
+		//printf("axl_ip_delete_key=%lu\n", axl_ip_delete_key);
 		pthread_mutex_lock(&axl_sweeper_mutex);	//进入临界区
 		if (axl_ip_delete_key == 0) axl_ip_sleep_time = AXL_DENYIP_TIME;
 		pthread_mutex_unlock(&axl_sweeper_mutex);	// 离开临界区
@@ -392,11 +496,12 @@ void axl_ip_sweeper(){
 		if (ipnode == NULL) ipnode = (axl_ip_node_t*)hashtable_find(axl_ips, axl_ip_delete_key);
 		
 		axl_ip_sleep_time = ipnode->assign_time + AXL_DENYIP_TIME - time(NULL);
+		//printf("-__ipnode(%.8x)->assign_time=%ld, key=%ld\n", ipnode, ipnode->assign_time, axl_ip_delete_key);
 		// 若已经超时则删除
 		if (axl_ip_sleep_time <= 0) {
 			current_key = axl_ip_delete_key;
 			axl_ip_delete_key = ipnode->next_key;
-			//printf("(delete)ip=%d, time=%ld, next=%ld\n", current_key, axl_ip_sleep_time, axl_ip_delete_key);
+			printf("(delete)ip=%d, now=%ld, axl_ip_sleep_time=%ld, next=%ld\n", current_key, time(NULL), axl_ip_sleep_time, axl_ip_delete_key);
 			hashtable_delete(axl_ips, current_key);
 			
 			// 计算下一个休眠时间
@@ -408,6 +513,7 @@ void axl_ip_sweeper(){
 				ipnode = NULL;
 			}
 		}
+		//printf("next to be delete %ld\n", axl_ip_sleep_time);
 		
 		pthread_mutex_unlock(&axl_sweeper_mutex);	//离开临界区
 	}
@@ -416,6 +522,196 @@ void axl_ip_sweeper(){
 
 #endif	// AXL_WITH_DENYIP
 
+#ifdef AXL_WITH_FORKSUPPORT
+/**
+ * 子进程接收到消息时，调用此函数给父进程发送收到新FTP指令的消息，并获取返回值
+ */
+axl_isxunlei_t axl_recive_command_msg(axl_ftpcmd_t cmd, unsigned long sess_id){
+	axl_msgbuf_t msg;
+	axl_msgbuf_isxunlei_t ret;
+	int msgid;
+	
+	// 创建一个新的消息队列用于接收消息
+	msgid = msgget(AXL_PARENT_MSGKEY + getpid(), IPC_CREAT | 0666);
+	if (msgid == -1) {
+		return AXL_ISXUNLEI_UNKNOWN;
+	}
+	
+	msg.mtype = AXL_MTYPE_RCVCMD;
+	msg.sess_id = sess_id;
+	msg.ftpcmd = cmd;
+	msg.retid = msgid;
+	
+	// 发送消息，然后等待返回
+	printf("(%d)[%s] %s%d\n", getpid(), __func__, "msg to be send to ", axl_pmsgid);
+	msgsnd(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), IPC_NOWAIT);
+	printf("(%d)[%s] %s%d\n", getpid(), __func__, "msg sent, wait from ", msgid);
+	msgrcv(msgid, &ret, sizeof(ret) - sizeof(ret.mtype), AXL_MTYPE_RET, 0L);
+	printf("(%d)[%s] %s\n", getpid(), __func__, "msg recive");
+	msgctl(msgid, IPC_RMID, NULL);
+		
+	return ret.msg;
+}
+
+/**
+ * 子进程进行IP屏蔽操作时，调用此函数，发送信号给父进程进行相应的操作，并获取返回值
+ */
+int axl_ip_deny_msg(unsigned long ip){
+	axl_msgbuf_t msg;
+	axl_msgbuf_int_t ret;
+	int msgid;
+	
+	// 创建一个新的消息队列用于接收消息
+	msgid = msgget(AXL_PARENT_MSGKEY + getpid(), IPC_CREAT | 0666);
+	if (msgid == -1) {
+		return -1;
+	}
+	
+	msg.mtype = AXL_MTYPE_IPDENY;
+	msg.sess_id = ip;
+	msg.retid = msgid;
+	
+	// 发送消息，然后等待返回
+	msgsnd(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), IPC_NOWAIT);
+	msgrcv(msgid, &ret, sizeof(ret) - sizeof(ret.mtype), AXL_MTYPE_RET, 0L);
+	msgctl(msgid, IPC_RMID, NULL);
+	
+	return ret.msg;
+}
+/**
+ * 子进程进行删除会话操作时，调用此函数，发送信号给父进程进行相应的操作，并获取返回值
+ */
+int axl_session_bye_msg(unsigned long sess_id){
+	axl_msgbuf_t msg;
+	axl_msgbuf_int_t ret;
+	int msgid;
+	
+	// 创建一个新的消息队列用于接收消息
+	msgid = msgget(AXL_PARENT_MSGKEY + getpid(), IPC_CREAT | 0666);
+	if (msgid == -1) {
+		return -1;
+	}
+	
+	msg.mtype = AXL_MTYPE_BYE;
+	msg.sess_id = sess_id;
+	msg.retid = msgid;
+	
+	// 发送消息，然后等待返回
+	msgsnd(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), IPC_NOWAIT);
+	msgrcv(msgid, &ret, sizeof(ret) - sizeof(ret.mtype), AXL_MTYPE_RET, 0L);
+	msgctl(msgid, IPC_RMID, NULL);
+	
+	return ret.msg;
+}
+
+/**
+ * 子进程进行 ip_denined 调用时，调用此函数发送信号给父进程处理，并接收返回值
+ */
+int axl_ip_denined_msg(unsigned long ip){
+	axl_msgbuf_t msg;
+	axl_msgbuf_int_t ret;
+	int msgid;
+	
+	// 创建一个新的消息队列用于接收消息
+	msgid = msgget(AXL_PARENT_MSGKEY + getpid(), IPC_CREAT | 0666);
+	if (msgid == -1) {
+		return -1;
+	}
+	
+	msg.mtype = AXL_MTYPE_IPDENINED;
+	msg.sess_id = ip;
+	msg.retid = msgid;
+	
+	// 发送消息，然后等待返回
+	msgsnd(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), IPC_NOWAIT);
+	msgrcv(msgid, &ret, sizeof(ret) - sizeof(ret.mtype), AXL_MTYPE_RET, 0L);
+	msgctl(msgid, IPC_RMID, NULL);
+	
+	return ret.msg;
+}
+
+/**
+ * 守护进程的 recive_ftpcmd 的消息处理线程
+ */
+void axl_msg_handler_rcvmsg(){
+	axl_msgbuf_isxunlei_t retmsg;
+	axl_msgbuf_t msg;
+	axl_isxunlei_t ret;
+	
+	retmsg.mtype = AXL_MTYPE_RET;
+	
+	//printf("[%s] started, wait for %d\n", __func__, axl_pmsgid);
+	
+	for (;;) {
+		// 等待消息
+		msgrcv(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), AXL_MTYPE_RCVCMD, 0L);
+		//printf("(%d)[%s] %s%d\n", getpid(), __func__, "handler recive msg from ", axl_pmsgid);
+		// 收到消息以后，送入AXL进行检测，并将返回值封装成消息发回给子进程
+		ret = axl_recive_command(msg.ftpcmd, msg.sess_id);
+		retmsg.msg = ret;
+		//printf("(%d)[%s] %s%d\n", getpid(), __func__, "ret msg to be send to ", msg.retid);
+		msgsnd(msg.retid, &retmsg, sizeof(retmsg) - sizeof(retmsg.mtype), IPC_NOWAIT);
+		//printf("(%d)[%s] %s\n", getpid(), __func__, "ret msg sent");
+	}
+}
+
+/**
+ * 守护进程的 IPDENY 消息处理线程
+ */
+void axl_msg_handler_ip_deny(){
+	int ret;
+	axl_msgbuf_int_t retmsg;
+	axl_msgbuf_t msg;
+	
+	retmsg.mtype = AXL_MTYPE_RET;
+	
+	for (;;) {
+		msgrcv(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), AXL_MTYPE_IPDENY, 0L);
+		
+		ret = axl_ip_deny(msg.sess_id);
+		retmsg.msg = ret;
+		msgsnd(msg.retid, &retmsg, sizeof(retmsg) - sizeof(retmsg.mtype), IPC_NOWAIT);
+	}
+}
+
+/**
+ * 守护进程的 session_bye 消息的处理线程
+ */
+void axl_msg_handler_session_bye(){
+	int ret;
+	axl_msgbuf_int_t retmsg;
+	axl_msgbuf_t msg;
+	
+	retmsg.mtype = AXL_MTYPE_RET;
+	
+	for (;;) {
+		msgrcv(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), AXL_MTYPE_BYE, 0L);
+		
+		ret = axl_session_bye(msg.sess_id);
+		retmsg.msg = ret;
+		msgsnd(msg.retid, &retmsg, sizeof(retmsg) - sizeof(retmsg.mtype), IPC_NOWAIT);
+	}
+}
+
+/**
+ * 守护进程处理 ip_denined 消息时的处理线程
+ */
+void axl_msg_handler_ip_denined(){
+	int ret;
+	axl_msgbuf_int_t retmsg;
+	axl_msgbuf_t msg;
+	
+	retmsg.mtype = AXL_MTYPE_RET;
+	
+	for (;;) {
+		msgrcv(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), AXL_MTYPE_IPDENINED, 0L);
+		
+		ret = axl_ip_denined(msg.sess_id);
+		retmsg.msg = ret;
+		msgsnd(msg.retid, &retmsg, sizeof(retmsg) - sizeof(retmsg.mtype), IPC_NOWAIT);
+	}
+}
+#endif	/* END AXL_WITH_FORKSUPPORT */
 
 /**
  * 下面开始到最后都是调试用的
@@ -426,14 +722,19 @@ void axl_ip_sweeper(){
 	printf("cmd=%d, is_xunlei=%d\n", CMD, axl_recive_command(CMD, UID));	\
 	//axl_recive_command(CMD,UID);
 
+//#define msgkey 11605532
+
 int main(){
 	axl_init();
+	
+	//printf("msgid=%d\n", msgget(msgkey, IPC_CREAT | IPC_EXCL | 0666));
 
+/*
 	A(AXL_FTPCMD_USER, 1);
 	A(AXL_FTPCMD_PASS, 1);
 	
 	//axl_recive_password("IEUser@", 1);
-	
+	//msgid = msgget(msgkey, IPC_CREAT | IPC_EXCL | 00660);
 	//A(AXL_FTPCMD_CWD, 1);
 	A(AXL_FTPCMD_TYPE, 1);
 	A(AXL_FTPCMD_SIZE, 1);
@@ -450,18 +751,35 @@ int main(){
 	A(AXL_FTPCMD_PASV, 2);
 	A(AXL_FTPCMD_REST, 2);
 	A(AXL_FTPCMD_RETR, 2);
+	*/
 	
-	
-	printf("%d\n", axl_ip_denined(100));
+	//axl_ip_deny(50);
 	axl_ip_deny(100);
-	printf("%d\n", axl_ip_denined(101));
-	printf("%d\n", axl_ip_denined(100));
+	axl_ip_deny(200);
+	axl_ip_deny(300);
+	
 	
 	while(1){
-		static unsigned long a = 1;
-		a = random() + 1;
-		axl_ip_deny(a);
-		usleep(random() % 6000000);
+		pid_t pid;
+		if ((pid = fork()) == 0) {
+			//exit(0);
+			printf("(fork)pid=%d\n", getpid());
+			static unsigned long a = 1;
+			a = random() + 1;
+			printf("(%d)::%d\n", getpid(), axl_ip_deny(a));
+			printf("#%d#:*%.8x\n", getpid(), axl_ip_denined(a));
+			printf("#%d*:*%.8x\n", getpid(), axl_ip_denined(a + 1));
+			usleep(random() % 60000);
+			printf("(child_proc %d)exit\n", getpid());
+			exit(0);
+		}
+		else {
+			static unsigned long b = 1;
+			b = random() + 1;
+			printf("((p)%d)::%d\n", getpid(), axl_ip_deny(b));
+			printf("pid=%ld\n", getpid());
+		}
+		usleep(random() % 60000);
 	}
 
 	return 0;
