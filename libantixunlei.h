@@ -150,4 +150,8 @@ void axl_msg_handler_ip_denined();
 
 #endif	/* END AXL_WITH_FORKSUPPORT */
 
+#ifdef AXL_WITH_UNIIDSUPPORT
+unsigned long axl_uniid_get();
 #endif
+
+#endif	/* END __LIBANTIXUNLE_H__ */

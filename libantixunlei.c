@@ -11,6 +11,9 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/msg.h>
+#include <semaphore.h>
+#include <fcntl.h>
+#include <sys/shm.h>
 
 #include "libantixunlei.h"
 #include "hashtable.h"
@@ -39,6 +42,12 @@ int axl_pmsgid;
 //int axl_pmsgid_sessbye;
 pthread_mutex_t axl_clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 struct sigaction axl_fork_sig, axl_fork_oldsig;
+#endif
+
+#ifdef AXL_WITH_UNIIDSUPPORT
+sem_t* axl_uniid_sem;
+int axl_uniid_shmid;
+unsigned long *axl_uniid_num;
 #endif
 
 /**
@@ -93,6 +102,19 @@ int axl_init(){
 	axl_parent_pid = getpid();
 #endif
 
+#ifdef AXL_WITH_UNIIDSUPPORT
+	// 唯一编号信号量初始化
+	printf("init sem\n");
+	axl_uniid_sem = sem_open("axl_uniid_sem", O_CREAT, 0666, 1);
+	if (axl_uniid_sem == SEM_FAILED) {
+		printf("无法创建信号量 axl_uniid_sem，sem_open 函数返回 SEM_FAILED。错误信息：%s\n", strerror(errno));
+		exit(2);
+	}
+	printf("get share memory\n");
+	axl_uniid_shmid = shmget(1111, sizeof(unsigned long), IPC_CREAT | 0666);
+	printf("AXL_WITH_UNIIDSUPPORT init finished\n");
+#endif
+
 #ifdef AXL_WITH_DENYIP	
 	// 创建IP封禁地址空间，同时创建清理线程
 	pthread_t sweeper_pid;
@@ -136,9 +158,18 @@ int axl_destroy(){
 	pthread_cancel(axl_hdlid_ipdeny);
 	pthread_cancel(axl_hdlid_sessbye);
 	pthread_cancel(axl_hdlid_ipdenined);
+	
 	msgctl(axl_pmsgid, IPC_RMID, NULL);
 	//msgctl(axl_pmsgid_ipdeny, IPC_RMID, NULL);
 	//msgctl(axl_pmsgid_sessbye, IPC_RMID, NULL);
+#endif
+
+#ifdef AXL_WITH_UNIIDSUPPORT
+	// 删除唯一编号信号量
+	sem_close(axl_uniid_sem);
+	//sem_unlink("/tmp/axl_uniid_sem");
+	
+	shmctl(axl_uniid_shmid, IPC_RMID, NULL);
 #endif
 	
 	return 0;
@@ -501,7 +532,7 @@ void axl_ip_sweeper(){
 		if (axl_ip_sleep_time <= 0) {
 			current_key = axl_ip_delete_key;
 			axl_ip_delete_key = ipnode->next_key;
-			printf("(delete)ip=%d, now=%ld, axl_ip_sleep_time=%ld, next=%ld\n", current_key, time(NULL), axl_ip_sleep_time, axl_ip_delete_key);
+			printf("(delete)ip=%lu, now=%ld, axl_ip_sleep_time=%ld, next=%ld\n", current_key, time(NULL), axl_ip_sleep_time, axl_ip_delete_key);
 			hashtable_delete(axl_ips, current_key);
 			
 			// 计算下一个休眠时间
@@ -713,6 +744,26 @@ void axl_msg_handler_ip_denined(){
 }
 #endif	/* END AXL_WITH_FORKSUPPORT */
 
+#ifdef AXL_WITH_UNIIDSUPPORT
+/**
+ * 调用此函数可返回一个唯一的编号，线程/进程安全
+ */
+unsigned long axl_uniid_get(){
+	unsigned long ret;
+	unsigned long *num;
+	
+	num = (unsigned long *)shmat(axl_uniid_shmid, 0, 0);
+
+	sem_wait(axl_uniid_sem);
+	ret = ++(*num);
+	sem_post(axl_uniid_sem);
+	
+	shmdt(num);
+	
+	return ret;
+}
+#endif /* END AXL_WITH_UNIIDSUPPORT */
+
 /**
  * 下面开始到最后都是调试用的
  */
@@ -769,7 +820,8 @@ int main(){
 			printf("(%d)::%d\n", getpid(), axl_ip_deny(a));
 			printf("#%d#:*%.8x\n", getpid(), axl_ip_denined(a));
 			printf("#%d*:*%.8x\n", getpid(), axl_ip_denined(a + 1));
-			usleep(random() % 60000);
+			printf("(%d):get_unique_id=%lu\n", getpid(), axl_uniid_get());
+			usleep(random() % 6000000);
 			printf("(child_proc %d)exit\n", getpid());
 			exit(0);
 		}
@@ -777,9 +829,9 @@ int main(){
 			static unsigned long b = 1;
 			b = random() + 1;
 			printf("((p)%d)::%d\n", getpid(), axl_ip_deny(b));
-			printf("pid=%ld\n", getpid());
+			printf("pid=%d\n", getpid());
 		}
-		usleep(random() % 60000);
+		usleep(random() % 6000000);
 	}
 
 	return 0;
