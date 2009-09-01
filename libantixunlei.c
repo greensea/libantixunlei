@@ -126,9 +126,9 @@ int axl_init(){
 
 #ifdef AXL_WITH_FORKSUPPORT
 	// 防止出现僵死进程
-	//sigaddset(&axl_fork_sig.sa_mask, SIGCHLD);
-	//axl_fork_sig.sa_flags = SA_NOCLDWAIT;
-	//sigaction(SIGCHLD, &axl_fork_sig, &axl_fork_oldsig);
+	sigaddset(&axl_fork_sig.sa_mask, SIGCHLD);
+	axl_fork_sig.sa_flags = SA_NOCLDWAIT;
+	sigaction(SIGCHLD, &axl_fork_sig, &axl_fork_oldsig);
 
 	// 创建父进程的接收消息队列
 	axl_pmsgid = msgget(AXL_PARENT_MSGKEY + getpid(), IPC_CREAT | 0666);
