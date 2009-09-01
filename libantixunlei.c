@@ -58,6 +58,7 @@ unsigned long *axl_uniid_num;
  * 如果启用了 FORKSUPPORT，则只能在FTP主进程中调用这个函数一次（且仅一次）。绝不能在fork()出来的子进程中调用此函数.
  */
 int axl_init(){
+	AXL_DEBUG("libantixunlei axl_init(), pid=%d\n", getpid());
 	/**
 	 * 自定义检查部分——开始——
 	 */
@@ -125,9 +126,9 @@ int axl_init(){
 
 #ifdef AXL_WITH_FORKSUPPORT
 	// 防止出现僵死进程
-	sigaddset(&axl_fork_sig.sa_mask, SIGCHLD);
-	axl_fork_sig.sa_flags = SA_NOCLDWAIT;
-	sigaction(SIGCHLD, &axl_fork_sig, &axl_fork_oldsig);
+	//sigaddset(&axl_fork_sig.sa_mask, SIGCHLD);
+	//axl_fork_sig.sa_flags = SA_NOCLDWAIT;
+	//sigaction(SIGCHLD, &axl_fork_sig, &axl_fork_oldsig);
 
 	// 创建父进程的接收消息队列
 	axl_pmsgid = msgget(AXL_PARENT_MSGKEY + getpid(), IPC_CREAT | 0666);
@@ -141,7 +142,11 @@ int axl_init(){
 	
 	// 创建消息处理线程
 	printf("axl_pmsgid=%d\n", axl_pmsgid);
-	pthread_create(&axl_hdlid_rcvcmd, NULL, (void*)axl_msg_handler_rcvmsg, NULL);
+	if (0 != pthread_create(&axl_hdlid_rcvcmd, NULL, (void*)axl_msg_handler_rcvmsg, NULL))
+	{
+		printf("pthread_create fail, error: %s\n", strerror(errno));
+		exit(2);
+	}
 	pthread_create(&axl_hdlid_ipdeny, NULL, (void*)axl_msg_handler_ip_deny, NULL);
 	pthread_create(&axl_hdlid_sessbye, NULL, (void*)axl_msg_handler_session_bye, NULL);
 	pthread_create(&axl_hdlid_ipdenined, NULL, (void*)axl_msg_handler_ip_denined, NULL);
@@ -152,6 +157,8 @@ int axl_init(){
 }
 
 int axl_destroy(){
+	AXL_DEBUG("axl_destroy()\n");
+	
 #ifdef AXL_WITH_FORKSUPPORT
 	// 终止消息处理线程，删除消息队列
 	pthread_cancel(axl_hdlid_rcvcmd);
@@ -201,10 +208,13 @@ axl_isxunlei_t axl_recive_command(axl_ftpcmd_t cmd, unsigned long sess_id){
 	// 如果查找无果，则将这家伙添加下去
 	if (client == NULL) {
 		client = axl_client_addnew(sess_id);
-	}
-	
+		AXL_DEBUG("(%d)[%s] client(%lu) not found in %.8x, add to %.8x \n", getpid(), __func__, cmd, axl_clients, client);
+		AXL_DEBUG("(%d)[%s] client(%.8x) current_pos=%d\n", getpid(), __func__, cmd, client, client->current_pos);
+	}	
 	// 如果这家伙的身份已经确定，则直接返回
 	else if (client->is_xunlei != AXL_ISXUNLEI_UNKNOWN) {
+AXL_DEBUG("(%d)[%s] msg '%d' client(%lu) found at \n in %.8x", getpid(), __func__, cmd, client, axl_clients);
+AXL_DEBUG("(%d)[%s] client(%.8x) current_pos=%d\n", getpid(), __func__, cmd, client, client->current_pos);
 		//printf("confirmed\n");
 		pthread_mutex_unlock(&axl_clients_mutex);	/* 离开临界区，信号量：clients */
 		return client->is_xunlei;
@@ -574,11 +584,12 @@ axl_isxunlei_t axl_recive_command_msg(axl_ftpcmd_t cmd, unsigned long sess_id){
 	msg.retid = msgid;
 	
 	// 发送消息，然后等待返回
-	printf("(%d)[%s] %s%d\n", getpid(), __func__, "msg to be send to ", axl_pmsgid);
-	msgsnd(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), IPC_NOWAIT);
-	printf("(%d)[%s] %s%d\n", getpid(), __func__, "msg sent, wait from ", msgid);
+	int sndsize;
+	AXL_DEBUG("(%d)[%s] msg '%d' to be send to \n", getpid(), __func__, cmd, axl_pmsgid);
+	msgsnd(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), 0L);
 	msgrcv(msgid, &ret, sizeof(ret) - sizeof(ret.mtype), AXL_MTYPE_RET, 0L);
-	printf("(%d)[%s] %s\n", getpid(), __func__, "msg recive");
+	AXL_DEBUG("(%d)[%s] msg recive: %d\n", getpid(), __func__, ret.msg);
+	
 	msgctl(msgid, IPC_RMID, NULL);
 		
 	return ret.msg;
@@ -603,7 +614,7 @@ int axl_ip_deny_msg(unsigned long ip){
 	msg.retid = msgid;
 	
 	// 发送消息，然后等待返回
-	msgsnd(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), IPC_NOWAIT);
+	msgsnd(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), 0L);
 	msgrcv(msgid, &ret, sizeof(ret) - sizeof(ret.mtype), AXL_MTYPE_RET, 0L);
 	msgctl(msgid, IPC_RMID, NULL);
 	
@@ -628,7 +639,7 @@ int axl_session_bye_msg(unsigned long sess_id){
 	msg.retid = msgid;
 	
 	// 发送消息，然后等待返回
-	msgsnd(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), IPC_NOWAIT);
+	msgsnd(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), 0L);
 	msgrcv(msgid, &ret, sizeof(ret) - sizeof(ret.mtype), AXL_MTYPE_RET, 0L);
 	msgctl(msgid, IPC_RMID, NULL);
 	
@@ -654,7 +665,7 @@ int axl_ip_denined_msg(unsigned long ip){
 	msg.retid = msgid;
 	
 	// 发送消息，然后等待返回
-	msgsnd(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), IPC_NOWAIT);
+	msgsnd(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), 0L);
 	msgrcv(msgid, &ret, sizeof(ret) - sizeof(ret.mtype), AXL_MTYPE_RET, 0L);
 	msgctl(msgid, IPC_RMID, NULL);
 	
@@ -671,18 +682,19 @@ void axl_msg_handler_rcvmsg(){
 	
 	retmsg.mtype = AXL_MTYPE_RET;
 	
-	//printf("[%s] started, wait for %d\n", __func__, axl_pmsgid);
+	AXL_DEBUG("[%s] started, wait for %d\n", __func__, axl_pmsgid);
 	
 	for (;;) {
 		// 等待消息
 		msgrcv(axl_pmsgid, &msg, sizeof(msg) - sizeof(msg.mtype), AXL_MTYPE_RCVCMD, 0L);
-		//printf("(%d)[%s] %s%d\n", getpid(), __func__, "handler recive msg from ", axl_pmsgid);
+		AXL_DEBUG("(%d)[%s] %s%d\n", getpid(), __func__, "handler recive msg from ", axl_pmsgid);
 		// 收到消息以后，送入AXL进行检测，并将返回值封装成消息发回给子进程
 		ret = axl_recive_command(msg.ftpcmd, msg.sess_id);
 		retmsg.msg = ret;
-		//printf("(%d)[%s] %s%d\n", getpid(), __func__, "ret msg to be send to ", msg.retid);
+		AXL_DEBUG("(%d)[%s] ret msg '%d' to be send to \n", getpid(), __func__, ret, msg.retid);
+		
 		msgsnd(msg.retid, &retmsg, sizeof(retmsg) - sizeof(retmsg.mtype), IPC_NOWAIT);
-		//printf("(%d)[%s] %s\n", getpid(), __func__, "ret msg sent");
+		AXL_DEBUG("(%d)[%s] %s\n", getpid(), __func__, "ret msg sent");
 	}
 }
 

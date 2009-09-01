@@ -154,4 +154,17 @@ void axl_msg_handler_ip_denined();
 unsigned long axl_uniid_get();
 #endif
 
+//#define AXL_DEBUG_FILE
+#ifdef AXL_DEBUG_FILE
+	#define AXL_DEBUG(__FORMAT, ...)	\
+		{	\
+		FILE* fp;	\
+		fp = fopen("/home/axl.log", "a");	\
+		if (fp != NULL) fprintf(fp, __FORMAT, ## __VA_ARGS__);	\
+		fclose(fp);	\
+		}
+#else
+	#define AXL_DEBUG(__FORMAT, ...) 
+#endif	/* END AXL_DEBUG_FILE */
+
 #endif	/* END __LIBANTIXUNLE_H__ */
